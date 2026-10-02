@@ -1,4 +1,220 @@
-<!DOCTYPE html>
+"""
+TECH X INNOVATION EVENT 2026 - E-Certificate Automation
+Single-file FastAPI application with embedded frontend and SQLite database.
+"""
+
+import re
+import sqlite3
+import logging
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, field_validator
+
+# PDF generation with reportlab
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import inch, cm
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import Paragraph, Frame
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+
+# =========================================================
+# LOGGING
+# =========================================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("cert_app")
+
+# =========================================================
+# DATABASE SETUP (SQLite)
+# =========================================================
+DB_PATH = Path(__file__).resolve().parent / "certificates.db"
+
+def init_db():
+    """Create participants table if it doesn't exist."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS participants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            certificate_id TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info("Database initialised at %s", DB_PATH)
+
+def save_participant(full_name: str, email: str, certificate_id: str):
+    """Insert a new participant record."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO participants (full_name, email, certificate_id) VALUES (?, ?, ?)",
+            (full_name, email, certificate_id)
+        )
+        conn.commit()
+        logger.info("Saved participant: %s (%s) [%s]", full_name, email, certificate_id)
+    except sqlite3.IntegrityError:
+        logger.warning("Certificate ID already exists: %s", certificate_id)
+    finally:
+        conn.close()
+
+# =========================================================
+# PDF CERTIFICATE GENERATION
+# =========================================================
+def generate_pdf_certificate(full_name: str, email: str) -> bytes:
+    """
+    Generate a simple PDF certificate using reportlab.
+    Returns the PDF as bytes.
+    """
+    from io import BytesIO
+
+    buffer = BytesIO()
+    # Landscape A4
+    page_width, page_height = landscape(A4)
+    c = canvas.Canvas(buffer, pagesize=landscape(A4))
+
+    # Background gradient (simulated with rectangles)
+    c.setFillColor(colors.HexColor("#f7faff"))
+    c.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+
+    # Border
+    c.setStrokeColor(colors.HexColor("#1d4ed8"))
+    c.setLineWidth(8)
+    c.rect(30, 30, page_width - 60, page_height - 60, fill=0, stroke=1)
+
+    c.setStrokeColor(colors.HexColor("#f97316"))
+    c.setLineWidth(3)
+    c.rect(45, 45, page_width - 90, page_height - 90, fill=0, stroke=1)
+
+    # Title
+    c.setFillColor(colors.HexColor("#0f172a"))
+    c.setFont("Helvetica-Bold", 36)
+    c.drawCentredString(page_width / 2, page_height - 110, "CERTIFICATE")
+
+    c.setFont("Helvetica-Bold", 22)
+    c.setFillColor(colors.HexColor("#1d4ed8"))
+    c.drawCentredString(page_width / 2, page_height - 155, "OF PARTICIPATION")
+
+    # Subtitle
+    c.setFont("Helvetica", 14)
+    c.setFillColor(colors.HexColor("#475569"))
+    c.drawCentredString(page_width / 2, page_height - 195, "This is proudly presented to")
+
+    # Name
+    c.setFont("Helvetica-Bold", 34)
+    c.setFillColor(colors.HexColor("#0b1220"))
+    c.drawCentredString(page_width / 2, page_height - 260, full_name)
+
+    # Line under name
+    c.setStrokeColor(colors.HexColor("#f97316"))
+    c.setLineWidth(2)
+    c.line(page_width / 2 - 200, page_height - 275, page_width / 2 + 200, page_height - 275)
+
+    # Event
+    c.setFont("Helvetica-Bold", 18)
+    c.setFillColor(colors.HexColor("#1d4ed8"))
+    c.drawCentredString(page_width / 2, page_height - 320, "TECH X INNOVATION EVENT 2026")
+
+    # Description
+    c.setFont("Helvetica", 12)
+    c.setFillColor(colors.HexColor("#475569"))
+    c.drawCentredString(page_width / 2, page_height - 360, "For active participation and successful completion of the event.")
+
+    # Email
+    c.setFont("Helvetica-Oblique", 10)
+    c.setFillColor(colors.HexColor("#64748b"))
+    c.drawCentredString(page_width / 2, page_height - 400, f"Participant Email: {email}")
+
+    # Date and Certificate ID
+    cert_id = str(uuid.uuid4())[:8].upper()
+    c.setFont("Helvetica", 10)
+    c.setFillColor(colors.HexColor("#475569"))
+    c.drawString(80, 80, f"Date: {datetime.now().strftime('%d %B %Y')}")
+    c.drawString(80, 65, f"Certificate ID: {cert_id}")
+
+    # Signature line
+    c.setStrokeColor(colors.HexColor("#1d4ed8"))
+    c.setLineWidth(1.5)
+    c.line(page_width - 250, 100, page_width - 80, 100)
+    c.setFont("Helvetica-Bold", 12)
+    c.setFillColor(colors.HexColor("#0f172a"))
+    c.drawCentredString(page_width - 165, 80, "Authorised Signatory")
+
+    # Footer
+    c.setFont("Helvetica", 8)
+    c.setFillColor(colors.HexColor("#94a3b8"))
+    c.drawCentredString(page_width / 2, 40, "TECH X INNOVATION EVENT 2026 • All Rights Reserved")
+
+    c.showPage()
+    c.save()
+
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+# =========================================================
+# FASTAPI APP
+# =========================================================
+app = FastAPI(
+    title="TECH X INNOVATION EVENT 2026 - E-Certificate Automation",
+    description="FastAPI Backend for generating participant E-Certificates dynamically.",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =========================================================
+# PYDANTIC MODELS
+# =========================================================
+class CertificateRequest(BaseModel):
+    fullName: str
+    email: str
+
+    @field_validator("fullName")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        name = v.strip()
+        if not name:
+            raise ValueError("Full Name is required.")
+        if len(name) < 3:
+            raise ValueError("Full Name must be at least 3 characters long.")
+        if len(name) > 60:
+            raise ValueError("Full Name cannot exceed 60 characters.")
+        if not re.match(r"^[A-Za-z][A-Za-z\s.'-]*$", name):
+            raise ValueError("Full Name contains invalid characters.")
+        return name
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        email = v.strip().lower()
+        if not email:
+            raise ValueError("Email ID is required.")
+        email_regex = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+        if not re.match(email_regex, email):
+            raise ValueError("Invalid email address format.")
+        return email
+
+# =========================================================
+# EMBEDDED FRONTEND HTML
+# =========================================================
+FRONTEND_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -1682,3 +1898,60 @@
   </script>
 </body>
 </html>
+"""
+
+# =========================================================
+# ROUTES
+# =========================================================
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_home():
+    return FRONTEND_HTML
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "TECH X INNOVATION E-Certificate API"}
+
+@app.post("/generate-certificate")
+async def generate_certificate(data: CertificateRequest):
+    try:
+        logger.info(f"Generating certificate for {data.fullName} ({data.email})")
+
+        # Generate PDF
+        pdf_bytes = generate_pdf_certificate(data.fullName, data.email)
+
+        # Save to database with a unique certificate ID
+        cert_id = str(uuid.uuid4())[:8].upper()
+        save_participant(data.fullName, data.email, cert_id)
+
+        # Format safe download filename
+        safe_name = re.sub(r'[^A-Za-z0-9]+', '_', data.fullName.strip()).strip('_')[:40]
+        filename = f"TECHX_2026_Certificate_{safe_name or 'Participant'}.pdf"
+
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+    except ValueError as ve:
+        logger.warning(f"Validation error: {ve}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error generating certificate: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while generating the certificate. Please try again."
+        )
+
+# =========================================================
+# RUN (for local development)
+# =========================================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
